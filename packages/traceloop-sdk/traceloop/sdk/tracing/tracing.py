@@ -31,10 +31,14 @@ from opentelemetry.instrumentation.threading import ThreadingInstrumentor
 from opentelemetry.semconv_ai import SpanAttributes
 from traceloop.sdk.images.image_uploader import ImageUploader
 from traceloop.sdk.instruments import Instruments
+from traceloop.sdk.privacy import attributes as privacy_attributes
+from traceloop.sdk.privacy.policy import RedactionPolicy
+from traceloop.sdk.privacy.redactor import configure_privacy_runtime, get_privacy_runtime
+from traceloop.sdk.privacy.scope import get_association_registry
 from traceloop.sdk.tracing.content_allow_list import ContentAllowList
 from traceloop.sdk.utils import is_notebook
 from traceloop.sdk.utils.package_check import is_package_installed
-from typing import Callable, Dict, List, Optional, Set, Union
+from typing import Callable, Dict, List, Mapping, Optional, Set, Union
 from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_AGENT_NAME,
     GEN_AI_CONVERSATION_ID,
@@ -85,11 +89,26 @@ class TracerWrapper(object):
         image_uploader: ImageUploader = None,
         span_postprocess_callback: Optional[Callable[[ReadableSpan], None]] = None,
         use_attributes: bool = True,
+        redaction_policy: Optional[Union[RedactionPolicy, Mapping[str, object]]] = None,
     ) -> "TracerWrapper":
+        # Every init() call defines the active redaction snapshot: an explicit
+        # policy enables it, ``None`` disables an already-installed one.
+        if redaction_policy is not None:
+            configure_privacy_runtime(redaction_policy)
+        elif get_privacy_runtime() is not None:
+            configure_privacy_runtime(None)
+
+        if hasattr(cls, "instance"):
+            if redaction_policy is not None:
+                cls.instance._install_privacy_hooks()
+            return cls.instance
+
         if not hasattr(cls, "instance"):
             obj = cls.instance = super(TracerWrapper, cls).__new__(cls)
             if not TracerWrapper.endpoint:
                 return obj
+
+            redaction_enabled = redaction_policy is not None
 
             obj.__image_uploader = image_uploader
             obj.__resource = Resource.create(TracerWrapper.resource_attributes)
@@ -139,7 +158,7 @@ class TracerWrapper(object):
                     # Create a wrapper that calls both the custom and original methods
                     original_on_end = obj.__spans_processor.on_end
 
-                    def wrapped_on_end(span):
+                    def wrapped_on_end(span, orig=original_on_end):
                         # OTel freezes a span's attributes (sets `_immutable`) in
                         # Span.end() before on_end runs, so the postprocess callback
                         # can't modify them. Temporarily unfreeze around the callback
@@ -155,12 +174,15 @@ class TracerWrapper(object):
                             if was_immutable:
                                 attributes._immutable = True
                         # Then call the original to ensure normal processing
-                        original_on_end(span)
+                        orig(span)
 
                     obj.__spans_processor.on_end = wrapped_on_end
 
                 obj.__spans_processor.on_start = obj._span_processor_on_start
                 obj.__tracer_provider.add_span_processor(obj.__spans_processor)
+
+            if redaction_enabled:
+                obj._install_privacy_hooks()
 
             if propagator:
                 set_global_textmap(propagator)
@@ -189,15 +211,71 @@ class TracerWrapper(object):
     def _span_processor_on_start(self, span, parent_context):
         default_span_processor_on_start(span, parent_context)
 
+        runtime = get_privacy_runtime()
+        if runtime is not None:
+            runtime.on_start(span)
+
         # TODO: this is here only because we need self to be able to access the content allow list
         # we should refactor this to not need self
-        association_properties = get_value("association_properties")
+        association_properties = get_value(
+            privacy_attributes.ASSOCIATION_PROPERTIES_CONTEXT_KEY
+        )
         if association_properties is not None:
             if not self.enable_content_tracing:
                 if self.__content_allow_list.is_allowed(association_properties):
-                    attach(set_value("override_enable_content_tracing", True))
+                    attach(
+                        set_value(
+                            privacy_attributes.CONTENT_OVERRIDE_CONTEXT_KEY, True
+                        )
+                    )
                 else:
-                    attach(set_value("override_enable_content_tracing", False))
+                    attach(
+                        set_value(
+                            privacy_attributes.CONTENT_OVERRIDE_CONTEXT_KEY, False
+                        )
+                    )
+
+    def _install_privacy_hooks(self):
+        """Wrap the processors' ``on_end`` with the built-in redaction pass.
+
+        Idempotent: a processor is only wrapped once. Since the wrapper looks
+        up the runtime at call time, later policy replacements take effect
+        without re-wrapping.
+        """
+        if not hasattr(self, "_TracerWrapper__spans_processor") and not hasattr(
+            self, "_TracerWrapper__spans_processors"
+        ):
+            return
+
+        processors: List[SpanProcessor] = []
+        if hasattr(self, "_TracerWrapper__spans_processor"):
+            processors = [self.__spans_processor]
+        elif hasattr(self, "_TracerWrapper__spans_processors"):
+            # Only the first processor runs the redaction pass; the rest would
+            # otherwise see an already-scanned span and tag it as skipped.
+            processors = list(self.__spans_processors)[:1]
+
+        for processor in processors:
+            if getattr(processor, "_traceloop_privacy_hook", False):
+                continue
+            original_on_end = processor.on_end
+
+            def wrapped_on_end(span, orig=original_on_end):
+                runtime = get_privacy_runtime()
+                if runtime is None or runtime.policy is None:
+                    # Redaction is not active: leave the original processor
+                    # path completely untouched.
+                    orig(span)
+                    return
+
+                def pipeline():
+                    runtime.redact_span(span)
+                    orig(span)
+
+                _with_mutable_attributes(span, pipeline)
+
+            processor.on_end = wrapped_on_end
+            setattr(processor, "_traceloop_privacy_hook", True)
 
     @staticmethod
     def set_static_params(
@@ -245,19 +323,40 @@ class TracerWrapper(object):
 
 
 def set_association_properties(properties: dict) -> None:
-    attach(set_value("association_properties", properties))
+    get_association_registry().bind(properties)
 
-    # Attach association properties to the current span, if it's a workflow or a task
-    span = trace.get_current_span()
-    if get_value("workflow_name") is not None or get_value("entity_name") is not None:
-        _set_association_properties_attributes(span, properties)
+
+def _with_mutable_attributes(span, callback: Callable[[], None]) -> None:
+    """Run ``callback`` with the span's frozen attributes temporarily mutable.
+
+    OTel freezes a span's attributes (sets ``_immutable``) in ``Span.end()``
+    before ``on_end`` runs, so writing to them fails. The flag is restored in
+    a ``finally`` block; if that restore fails the scan state is marked
+    ``failed`` (best effort) and the error is swallowed.
+    """
+    attributes = getattr(span, "_attributes", None)
+    was_immutable = getattr(attributes, "_immutable", False)
+    if was_immutable:
+        attributes._immutable = False
+    try:
+        callback()
+    finally:
+        if was_immutable:
+            try:
+                attributes._immutable = True
+            except Exception:
+                try:
+                    attributes._immutable = False
+                    attributes[
+                        privacy_attributes.TRACELOOP_PRIVACY_SCAN_STATE
+                    ] = privacy_attributes.SCAN_STATE_FAILED
+                except Exception:
+                    pass
 
 
 def _set_association_properties_attributes(span, properties: dict) -> None:
     for key, value in properties.items():
-        span.set_attribute(
-            f"{SpanAttributes.TRACELOOP_ASSOCIATION_PROPERTIES}.{key}", value
-        )
+        span.set_attribute(privacy_attributes.association_property_key(key), value)
 
 
 def set_workflow_name(workflow_name: str) -> object:
@@ -404,7 +503,9 @@ def default_span_processor_on_start(span: Span, parent_context: Context | None =
     if entity_path is not None:
         span.set_attribute(SpanAttributes.TRACELOOP_ENTITY_PATH, str(entity_path))
 
-    association_properties = get_value("association_properties")
+    association_properties = get_value(
+        privacy_attributes.ASSOCIATION_PROPERTIES_CONTEXT_KEY
+    )
     if association_properties is not None and isinstance(association_properties, dict):
         _set_association_properties_attributes(span, association_properties)
 
@@ -1218,11 +1319,13 @@ def metrics_common_attributes():
     if entity_name is not None:
         common_attributes[SpanAttributes.TRACELOOP_ENTITY_NAME] = entity_name
 
-    association_properties = get_value("association_properties")
+    association_properties = get_value(
+        privacy_attributes.ASSOCIATION_PROPERTIES_CONTEXT_KEY
+    )
     if association_properties is not None:
         for key, value in association_properties.items():
             common_attributes[
-                f"{SpanAttributes.TRACELOOP_ASSOCIATION_PROPERTIES}.{key}"
+                privacy_attributes.association_property_key(key)
             ] = value
 
     return common_attributes

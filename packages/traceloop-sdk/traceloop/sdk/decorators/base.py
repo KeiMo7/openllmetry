@@ -20,6 +20,7 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
     GEN_AI_TOOL_NAME,
 )
 
+from traceloop.sdk.privacy import attributes as privacy_attributes
 from traceloop.sdk.tracing import get_tracer, set_workflow_name, set_agent_name
 from traceloop.sdk.tracing.tracing import (
     TracerWrapper,
@@ -162,8 +163,10 @@ async def _ahandle_generator(span, ctx_tokens, res):
 
 def _should_send_prompts():
     return (
-        os.getenv("TRACELOOP_TRACE_CONTENT") or "true"
-    ).lower() == "true" or context_api.get_value("override_enable_content_tracing")
+        os.getenv(privacy_attributes.TRACE_CONTENT_ENV_VAR) or "true"
+    ).lower() == "true" or context_api.get_value(
+        privacy_attributes.CONTENT_OVERRIDE_CONTEXT_KEY
+    )
 
 
 # Unified Decorators : handles both sync and async operations
@@ -226,7 +229,7 @@ def _handle_span_input(span, args, kwargs, cls=None):
             )
             truncated_json = _truncate_json_if_needed(json_input)
             span.set_attribute(
-                SpanAttributes.TRACELOOP_ENTITY_INPUT,
+                privacy_attributes.TRACELOOP_ENTITY_INPUT,
                 truncated_json,
             )
     except TypeError:
@@ -240,7 +243,7 @@ def _handle_span_output(span, res, cls=None):
             json_output = json.dumps(res, **({"cls": cls} if cls else {}))
             truncated_json = _truncate_json_if_needed(json_output)
             span.set_attribute(
-                SpanAttributes.TRACELOOP_ENTITY_OUTPUT,
+                privacy_attributes.TRACELOOP_ENTITY_OUTPUT,
                 truncated_json,
             )
     except TypeError:

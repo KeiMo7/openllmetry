@@ -17,6 +17,7 @@ from tenacity import (
 
 from traceloop.sdk.prompts.registry import PromptRegistry
 from traceloop.sdk.prompts.client import PromptRegistryClient
+from traceloop.sdk.privacy.scope import get_association_registry
 from traceloop.sdk.tracing.content_allow_list import ContentAllowList
 from traceloop.sdk.version import __version__
 
@@ -157,6 +158,7 @@ def refresh_data(
 
     response = fetch_url(f"{base_url}/v1/traceloop/pii/tracing-allow-list", api_key)
     content_allow_list.load(response)
+    get_association_registry().reload_allow_list(response)
 
 
 def monitor_exit(exit_event: Event) -> None:

@@ -3,7 +3,7 @@ import sys
 import warnings
 from pathlib import Path
 
-from typing import Callable, List, Optional, Set, Union
+from typing import Callable, List, Optional, Set, Union, Mapping
 from colorama import Fore
 from opentelemetry.sdk.trace import SpanProcessor, ReadableSpan
 from opentelemetry.sdk.trace.sampling import Sampler
@@ -25,6 +25,8 @@ from traceloop.sdk.config import (
     is_logging_enabled,
 )
 from traceloop.sdk.fetcher import Fetcher
+from traceloop.sdk.privacy.policy import RedactionPolicy
+from traceloop.sdk.privacy.redactor import load_policy_from_env
 from traceloop.sdk.tracing.tracing import (
     TracerWrapper,
     set_association_properties,
@@ -74,6 +76,7 @@ class Traceloop:
         use_attributes: Optional[bool] = None,
         use_legacy_attributes: Optional[bool] = None,
         trace_content: Optional[bool] = None,
+        redaction_policy: Optional[Union[RedactionPolicy, Mapping[str, object]]] = None,
     ) -> Optional[Client]:
         """Initialize Traceloop tracing, metrics, and instrumentation.
 
@@ -107,7 +110,24 @@ class Traceloop:
                 when ``enabled=False`` or when tracing is disabled via
                 ``TRACELOOP_TRACING_ENABLED`` — both checks happen before this
                 override runs.
+            redaction_policy: Optional redaction policy, either a
+                :class:`~traceloop.sdk.privacy.RedactionPolicy` or a mapping
+                accepted by :meth:`RedactionPolicy.from_dict`. When omitted,
+                ``TRACELOOP_REDACTION_POLICY`` (inline JSON or a file path) is
+                honored. An invalid explicit policy raises
+                :class:`~traceloop.sdk.privacy.RedactionPolicyError`; an invalid
+                environment policy logs a warning and leaves redaction off.
         """
+        explicit_policy: Optional[RedactionPolicy] = None
+        if redaction_policy is not None:
+            if isinstance(redaction_policy, RedactionPolicy):
+                explicit_policy = redaction_policy
+            elif isinstance(redaction_policy, Mapping):
+                explicit_policy = RedactionPolicy.from_dict(redaction_policy)
+            else:
+                raise TypeError(
+                    "redaction_policy must be a RedactionPolicy or a mapping"
+                )
         if use_attributes is not None and use_legacy_attributes is not None:
             raise TypeError(
                 "Cannot pass both `use_attributes` and `use_legacy_attributes`; "
@@ -150,6 +170,10 @@ class Traceloop:
             )
 
         enable_content_tracing = is_content_tracing_enabled()
+
+        resolved_policy: Optional[RedactionPolicy] = explicit_policy
+        if resolved_policy is None:
+            resolved_policy = load_policy_from_env()
 
         if exporter and processor:
             warnings.warn(
@@ -217,6 +241,7 @@ class Traceloop:
             block_instruments=block_instruments,
             span_postprocess_callback=span_postprocess_callback,
             use_attributes=use_attributes,
+            redaction_policy=resolved_policy,
         )
 
         metrics_disabled_by_config = not is_metrics_enabled()
